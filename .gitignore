@@ -1,0 +1,10 @@
+# Created with AI assistance (Freebuff / Codebuff). See NOTICE.md.
+
+dist/
+node_modules/
+.freebuff/
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

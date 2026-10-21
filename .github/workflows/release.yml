@@ -1,0 +1,40 @@
+# AI notice: created with AI assistance (Freebuff / Codebuff). See NOTICE.md.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Verify tag matches package version
+        run: |
+          node -e "const p=require('./package.json'); const tag=process.env.GITHUB_REF_NAME; if (tag !== 'v'+p.version) { console.error('Tag '+tag+' does not match v'+p.version); process.exit(1); }"
+      - name: Validate and test
+        run: npm run check
+      - name: Build
+        run: npm run build
+      - name: Verify package contents
+        run: |
+          unzip -l dist/knkr-pathing-v*.zip
+          unzip -p dist/knkr-pathing-v*.zip knkr-pathing/module.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);if(!m.id||!m.version)process.exit(1);console.log('manifest',m.id,m.version)})"
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/module.json
+            dist/knkr-pathing-v*.zip
+          generate_release_notes: true
+          draft: false
