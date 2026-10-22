@@ -5,7 +5,16 @@
  * when Foundry is unavailable or a setting has not been registered yet.
  */
 
-import { DEFAULTS, ENEMY_POLICY, MODULE_ID, SETTING_KEYS } from "./constants.mjs";
+import { DEFAULTS, ENEMY_POLICY, GAP_CLEARANCE, MODULE_ID, SETTING_KEYS } from "./constants.mjs";
+
+const SIZE_LABELS = Object.freeze({
+  tiny: "Tiny",
+  small: "Small",
+  medium: "Medium",
+  large: "Large",
+  huge: "Huge",
+  gargantuan: "Gargantuan"
+});
 
 function localize(key) {
   try {
@@ -38,45 +47,30 @@ export function registerSettings() {
     onChange: () => globalThis.Hooks?.callAll("knkrPathingSettingsChanged")
   });
 
-  register(SETTING_KEYS.squeezeFactor, {
-    name: localize("KNKR_PATHING.Settings.SqueezeFactor.Name"),
-    hint: localize("KNKR_PATHING.Settings.SqueezeFactor.Hint"),
+  register(SETTING_KEYS.gapClearance, {
+    name: localize("KNKR_PATHING.Settings.GapClearance.Name"),
+    hint: localize("KNKR_PATHING.Settings.GapClearance.Hint"),
     scope: "world",
     config: true,
     type: Number,
+    default: DEFAULTS.gapClearance,
     range: { min: 0.1, max: 1, step: 0.05 },
-    default: DEFAULTS.squeezeFactor
+    onChange: () => globalThis.Hooks?.callAll("knkrPathingSettingsChanged")
   });
 
-  register(SETTING_KEYS.squeezeMultiplier, {
-    name: localize("KNKR_PATHING.Settings.SqueezeMultiplier.Name"),
-    hint: localize("KNKR_PATHING.Settings.SqueezeMultiplier.Hint"),
-    scope: "world",
-    config: true,
-    type: Number,
-    range: { min: 1, max: 4, step: 0.5 },
-    default: DEFAULTS.squeezeMultiplier
-  });
-
-  register(SETTING_KEYS.markerDiameterFeet, {
-    name: localize("KNKR_PATHING.Settings.MarkerDiameter.Name"),
-    hint: localize("KNKR_PATHING.Settings.MarkerDiameter.Hint"),
-    scope: "world",
-    config: true,
-    type: Number,
-    range: { min: 0.5, max: 10, step: 0.5 },
-    default: DEFAULTS.markerDiameterFeet
-  });
-
-  register(SETTING_KEYS.markerActivationPaddingFeet, {
-    name: localize("KNKR_PATHING.Settings.MarkerPadding.Name"),
-    hint: localize("KNKR_PATHING.Settings.MarkerPadding.Hint"),
-    scope: "world",
-    config: true,
-    type: Number,
-    range: { min: 0, max: 5, step: 0.25 },
-    default: DEFAULTS.markerActivationPaddingFeet
-  });
+  for (const bucket of GAP_CLEARANCE.buckets) {
+    const label = SIZE_LABELS[bucket] ?? bucket;
+    register(GAP_CLEARANCE.settings[bucket], {
+      name: localize(`KNKR_PATHING.Settings.GapClearance.${label}.Name`),
+      hint: localize("KNKR_PATHING.Settings.GapClearance.OverrideHint"),
+      scope: "world",
+      config: true,
+      type: Number,
+      default: DEFAULTS[GAP_CLEARANCE.settings[bucket]] ?? 0,
+      range: { min: 0, max: 1, step: 0.05 },
+      onChange: () => globalThis.Hooks?.callAll("knkrPathingSettingsChanged")
+    });
+  }
 
   register(SETTING_KEYS.enemyPolicy, {
     name: localize("KNKR_PATHING.Settings.EnemyPolicy.Name"),
@@ -101,22 +95,13 @@ export function registerSettings() {
     default: DEFAULTS.includeHiddenEnemies
   });
 
-  register(SETTING_KEYS.enforceMovementBudget, {
-    name: localize("KNKR_PATHING.Settings.EnforceBudget.Name"),
-    hint: localize("KNKR_PATHING.Settings.EnforceBudget.Hint"),
-    scope: "world",
-    config: true,
-    type: Boolean,
-    default: DEFAULTS.enforceMovementBudget
-  });
-
-  register(SETTING_KEYS.showCostLabel, {
-    name: localize("KNKR_PATHING.Settings.ShowCostLabel.Name"),
-    hint: localize("KNKR_PATHING.Settings.ShowCostLabel.Hint"),
+  register(SETTING_KEYS.showDistanceLabel, {
+    name: localize("KNKR_PATHING.Settings.ShowDistanceLabel.Name"),
+    hint: localize("KNKR_PATHING.Settings.ShowDistanceLabel.Hint"),
     scope: "client",
     config: true,
     type: Boolean,
-    default: DEFAULTS.showCostLabel
+    default: DEFAULTS.showDistanceLabel
   });
 
   register(SETTING_KEYS.debug, {
@@ -144,30 +129,39 @@ export function getSetting(key) {
 }
 
 /**
+ * Current gap-clearance settings. Per-size values of 0 mean "inherit the
+ * default" and are omitted from the override map.
+ * @returns {{gapClearance: number, gapClearanceOverrides: Record<string, number>}}
+ */
+export function readGapClearanceSettings() {
+  const gapClearance = Number(getSetting(SETTING_KEYS.gapClearance));
+  const gapClearanceOverrides = {};
+  for (const bucket of GAP_CLEARANCE.buckets) {
+    const value = Number(getSetting(GAP_CLEARANCE.settings[bucket]));
+    if (Number.isFinite(value) && value > 0) gapClearanceOverrides[bucket] = value;
+  }
+  return {
+    gapClearance: Number.isFinite(gapClearance) && gapClearance > 0
+      ? gapClearance
+      : DEFAULTS.gapClearance,
+    gapClearanceOverrides
+  };
+}
+
+/**
  * Snapshot of all runtime settings used by a drag.
  * @param {object | null} scene
  * @param {number} unitsPerPixelValue
  */
 export function readRuntimeSettings(scene, unitsPerPixelValue) {
   const safeUnitsPerPixel = Number(unitsPerPixelValue) > 0 ? Number(unitsPerPixelValue) : 0.05;
-  const markerDiameterFeet = Number(getSetting(SETTING_KEYS.markerDiameterFeet)) || DEFAULTS.markerDiameterFeet;
-  const markerPaddingFeet = Number(getSetting(SETTING_KEYS.markerActivationPaddingFeet)) || 0;
-  const markerDiameter = markerDiameterFeet / safeUnitsPerPixel;
-  const markerPadding = markerPaddingFeet / safeUnitsPerPixel;
 
   return {
     enabled: Boolean(getSetting(SETTING_KEYS.enabled)),
-    squeezeFactor: Number(getSetting(SETTING_KEYS.squeezeFactor)) || DEFAULTS.squeezeFactor,
-    squeezeMultiplier: Number(getSetting(SETTING_KEYS.squeezeMultiplier)) || DEFAULTS.squeezeMultiplier,
-    markerDiameterFeet,
-    markerPaddingFeet,
-    markerDiameter,
-    markerPadding,
-    markerBackoff: markerDiameter + markerPadding,
+    ...readGapClearanceSettings(),
     enemyPolicy: String(getSetting(SETTING_KEYS.enemyPolicy) ?? DEFAULTS.enemyPolicy),
     includeHiddenEnemies: Boolean(getSetting(SETTING_KEYS.includeHiddenEnemies)),
-    enforceMovementBudget: Boolean(getSetting(SETTING_KEYS.enforceMovementBudget)),
-    showCostLabel: Boolean(getSetting(SETTING_KEYS.showCostLabel)),
+    showDistanceLabel: Boolean(getSetting(SETTING_KEYS.showDistanceLabel)),
     debug: Boolean(getSetting(SETTING_KEYS.debug)),
     unitsPerPixel: safeUnitsPerPixel,
     scene: scene?.id ?? null

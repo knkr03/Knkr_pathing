@@ -1,7 +1,7 @@
 {
   "name": "knkr-pathing",
-  "version": "0.1.0",
-  "description": "Foundry VTT module: gridless pathfinding, squeezing, and enemy collision for D&D 5e.",
+  "version": "1.0.0",
+  "description": "Foundry VTT module: gridless pathfinding, configurable gap clearance with per-size overrides, enemy collision, partial moves, and D&D 5e Movement Limiter compatibility.",
   "private": true,
   "type": "module",
   "aiNotice": "This file and every other file in this repository were created with AI assistance. See NOTICE.md.",
@@ -10,6 +10,7 @@
     "test:watch": "node --test --watch",
     "validate": "node scripts/validate.mjs",
     "build": "node scripts/build-release.mjs",
+    "install:local": "node scripts/install-local.mjs",
     "check": "npm run validate && npm test"
   },
   "engines": {

@@ -10,13 +10,11 @@ import { getCanvasInterface } from "../compat.mjs";
 
 const COLORS = Object.freeze({
   normal: 0x48c8ff,
-  squeeze: 0xffab3d,
+  limited: 0xffc857,
   blocked: 0xff5555,
   contact: 0xff7a7a,
   waypoint: 0xdff4ff,
-  marker: 0xffab3d,
   label: 0xffffff,
-  labelSqueeze: 0xffc46b,
   labelBad: 0xff9a9a
 });
 
@@ -67,22 +65,85 @@ function strokeCircle(graphics, x, y, radius, width, color, alpha = 1) {
     if (typeof target.circle === "function") target.circle(x, y, radius);
     else target.drawCircle(x, y, radius);
   });
+  graphics.finishPoly?.();
+}
+
+/**
+ * Stroke a whole polyline in one style. Committing the path explicitly avoids
+ * leaving the final segment pending in PIXI's current path until the next
+ * style change or render.
+ */
+function strokePolyline(graphics, points, width, color, alpha = 1) {
+  if (!Array.isArray(points) || points.length < 2) return;
+  // Drop repeated points: a degenerate subpath can corrupt a batched stroke.
+  const path = [];
+  for (const point of points) {
+    const previous = path.at(-1);
+    if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < 0.01) continue;
+    path.push(point);
+  }
+  if (path.length < 2) return;
+  stroke(graphics, width, color, alpha, (target) => {
+    target.moveTo(path[0].x, path[0].y);
+    for (const point of path.slice(1)) target.lineTo(point.x, point.y);
+  });
+  graphics.finishPoly?.();
+}
+
+/**
+ * Whether a plan moved away from its origin. Used to avoid placing a terminal
+ * marker on a blocked plan that has no legal movement at all.
+ * @param {object} plan
+ * @param {{x: number, y: number}} endpoint
+ */
+function movedFromStart(plan, endpoint) {
+  const start = plan.start;
+  if (!start || !Number.isFinite(start.x) || !Number.isFinite(start.y)) return true;
+  return Math.hypot(endpoint.x - start.x, endpoint.y - start.y) > 1;
+}
+
+/**
+ * Stroke a set of disjoint segments in one style. A single style change for
+ * the whole set keeps PIXI's batched stroke state consistent.
+ */
+function strokeSegments(graphics, segments, width, color, alpha = 1) {
+  if (!segments.length) return;
+  stroke(graphics, width, color, alpha, (target) => {
+    for (const segment of segments) {
+      target.moveTo(segment.a.x, segment.a.y);
+      target.lineTo(segment.b.x, segment.b.y);
+    }
+  });
+  graphics.finishPoly?.();
 }
 
 export class PreviewRenderer {
   constructor() {
     this.container = null;
     this.graphics = null;
-    this.markers = null;
     this.label = null;
   }
 
   /** @returns {boolean} */
   attach() {
-    if (this.container) return true;
     const pixi = globalThis.PIXI;
     const parent = getCanvasInterface();
     if (!pixi?.Container || !pixi?.Graphics || !parent) return false;
+
+    // A canvas re-render can replace the interface group without a teardown
+    // hook. Re-parent the existing overlay instead of drawing into a detached
+    // container (which would show no path).
+    if (this.container) {
+      if (this.container.parent !== parent) {
+        try {
+          parent.addChild(this.container);
+        } catch {
+          this.detach();
+          return false;
+        }
+      }
+      return true;
+    }
 
     try {
       this.container = new pixi.Container();
@@ -94,8 +155,6 @@ export class PreviewRenderer {
 
       this.graphics = new pixi.Graphics();
       this.graphics.interactive = false;
-      this.markers = new pixi.Graphics();
-      this.markers.interactive = false;
 
       this.label = new pixi.Text("", {
         fontFamily: "Signika, sans-serif",
@@ -109,7 +168,6 @@ export class PreviewRenderer {
       this.label.interactive = false;
 
       this.container.addChild(this.graphics);
-      this.container.addChild(this.markers);
       this.container.addChild(this.label);
       parent.addChild(this.container);
       return true;
@@ -129,14 +187,12 @@ export class PreviewRenderer {
     }
     this.container = null;
     this.graphics = null;
-    this.markers = null;
     this.label = null;
   }
 
   clear() {
     try {
       this.graphics?.clear();
-      this.markers?.clear();
     } catch {
       // Rendering must never break a drag.
     }
@@ -151,68 +207,46 @@ export class PreviewRenderer {
   draw(plan, context = {}) {
     if (!this.attach()) return;
     this.clear();
-    if (!plan || !this.graphics || !this.markers) return;
+    if (!plan || !this.graphics) return;
 
     this.drawPath(plan);
-    this.drawMarkers(plan, context);
     this.drawIndicators(plan, context);
     this.drawLabel(plan, context);
   }
 
   /** @param {object} plan */
   drawPath(plan) {
-    const segments = Array.isArray(plan.segments) && plan.segments.length > 0
-      ? plan.segments
-      : null;
+    const points = Array.isArray(plan.points)
+      ? plan.points.filter((point) => Number.isFinite(point?.x) && Number.isFinite(point?.y))
+      : [];
+    const segments = Array.isArray(plan.segments)
+      ? plan.segments.filter((segment) =>
+        Number.isFinite(segment?.a?.x) && Number.isFinite(segment?.a?.y)
+        && Number.isFinite(segment?.b?.x) && Number.isFinite(segment?.b?.y))
+      : [];
 
-    // Dark outline first so the bright route stays visible on any map.
-    if (segments) {
-      stroke(this.graphics, 8, 0x000000, 0.35, (graphics) => {
-        for (const segment of segments) {
-          graphics.moveTo(segment.a.x, segment.a.y);
-          graphics.lineTo(segment.b.x, segment.b.y);
-        }
-      });
-      for (const segment of segments) {
-        const color = segment.mode === "squeeze"
-          ? COLORS.squeeze
-          : segment.mode === "blocked"
-          ? COLORS.blocked
-          : COLORS.normal;
-        stroke(this.graphics, 4.5, color, 0.95, (graphics) => {
-          graphics.moveTo(segment.a.x, segment.a.y);
-          graphics.lineTo(segment.b.x, segment.b.y);
-        });
-      }
-    } else if (Array.isArray(plan.points) && plan.points.length > 1) {
-      stroke(this.graphics, 6, 0x000000, 0.3, (graphics) => {
-        graphics.moveTo(plan.points[0].x, plan.points[0].y);
-        for (const point of plan.points.slice(1)) graphics.lineTo(point.x, point.y);
-      });
-      stroke(this.graphics, 3, COLORS.normal, 0.9, (graphics) => {
-        graphics.moveTo(plan.points[0].x, plan.points[0].y);
-        for (const point of plan.points.slice(1)) graphics.lineTo(point.x, point.y);
-      });
+    // Always draw the route from its polyline first. Some plans (rotation) have
+    // no costed segments, and a stale or partial segment list must never leave
+    // the user with dots and no line.
+    const routeColor = plan.status === "limited" ? COLORS.limited : COLORS.normal;
+    if (points.length > 1) {
+      strokePolyline(this.graphics, points, 8, 0x000000, 0.35);
+      strokePolyline(this.graphics, points, 4.5, routeColor, 0.95);
+    } else if (segments.length > 0) {
+      strokeSegments(this.graphics, segments, 8, 0x000000, 0.35);
+      strokeSegments(this.graphics, segments, 4.5, routeColor, 0.95);
     }
+
+    // Overlay blocked segments in one pass so a partially valid route still
+    // shows which portion is illegal.
+    const blocked = segments.filter((segment) => segment.mode === "blocked");
+    if (blocked.length > 0) strokeSegments(this.graphics, blocked, 4.5, COLORS.blocked, 0.95);
 
     // Waypoint dots make bends legible without cluttering the line.
-    if (Array.isArray(plan.points) && plan.points.length > 2) {
-      for (const point of plan.points.slice(1, -1)) {
+    if (points.length > 2) {
+      for (const point of points.slice(1, -1)) {
         fillCircle(this.graphics, point.x, point.y, 3.2, COLORS.waypoint, 0.9);
       }
-    }
-  }
-
-  /** @param {object} plan @param {object} context */
-  drawMarkers(plan, context) {
-    if (context.squeezeActive) return;
-    if (!Array.isArray(plan.markers)) return;
-    for (const marker of plan.markers) {
-      const radius = Math.max(4, Number(marker.radius) || 8);
-      fillCircle(this.markers, marker.x, marker.y, radius + 5, COLORS.marker, 0.16);
-      strokeCircle(this.markers, marker.x, marker.y, radius + 5, 1.5, COLORS.marker, 0.5);
-      strokeCircle(this.markers, marker.x, marker.y, radius, 3, COLORS.marker, 0.95);
-      fillCircle(this.markers, marker.x, marker.y, Math.max(2, radius * 0.22), COLORS.marker, 0.95);
     }
   }
 
@@ -232,40 +266,30 @@ export class PreviewRenderer {
 
     if (endpoint) {
       if (plan.rotation) {
-        strokeCircle(this.graphics, endpoint.x, endpoint.y, 9, 3, COLORS.squeeze, 0.95);
+        strokeCircle(this.graphics, endpoint.x, endpoint.y, 9, 3, COLORS.contact, 0.95);
       } else if (plan.status === "contact") {
         strokeCircle(this.graphics, endpoint.x, endpoint.y, 9, 3, COLORS.contact, 0.95);
-      } else if (plan.status === "budget") {
-        strokeCircle(this.graphics, endpoint.x, endpoint.y, 8, 3, COLORS.squeeze, 0.95);
-      } else if (plan.status !== "impassable") {
+      } else if (plan.status !== "impassable" || movedFromStart(plan, endpoint)) {
+        // A blocked plan still has a potential stopping point. Mark it the same
+        // way as a normal route endpoint while the red X continues to show the
+        // unreachable destination.
         fillCircle(this.graphics, endpoint.x, endpoint.y, 4, 0xffffff, 0.95);
       }
-    }
-
-    // When squeezing is required but not committed, show where the token is
-    // actually constrained (before the gap).
-    if (context.appliedCenter && !context.squeezeActive && plan.routeMode === "squeeze") {
-      strokeCircle(this.graphics, context.appliedCenter.x, context.appliedCenter.y, 7, 2, 0xffffff, 0.85);
     }
   }
 
   /** @param {object} plan @param {object} context */
   drawLabel(plan, context) {
-    if (!this.label || context.showCostLabel === false) return;
+    if (!this.label || context.showDistanceLabel === false) return;
 
     const units = context.units ?? "ft";
     const distance = formatNumber(plan.totalDistance);
-    const cost = formatNumber(plan.totalCost);
-    const status = this.statusLabel(plan, context);
-    const template = plan.squeezeDistance > 0
-      ? localize("KNKR_PATHING.Preview.SqueezeCost", "{distance} {units} · {cost} {units} cost (squeeze ×{multiplier})")
-      : localize("KNKR_PATHING.Preview.Cost", "{distance} {units} · {cost} {units} cost");
+    const status = this.statusLabel(plan);
+    const template = localize("KNKR_PATHING.Preview.Distance", "{distance} {units}");
 
     let text = template
       .replaceAll("{distance}", distance)
-      .replaceAll("{cost}", cost)
-      .replaceAll("{units}", units)
-      .replaceAll("{multiplier}", formatNumber(context.squeezeMultiplier ?? 2));
+      .replaceAll("{units}", units);
 
     if (status) text = `${status} · ${text}`;
     if (!text) return;
@@ -273,9 +297,7 @@ export class PreviewRenderer {
     this.label.text = text;
     this.label.style.fill = plan.status === "impassable" || plan.status === "contact"
       ? COLORS.labelBad
-      : plan.squeezeDistance > 0
-      ? COLORS.labelSqueeze
-      : COLORS.label;
+      : (plan.status === "limited" ? COLORS.limited : COLORS.label);
     this.label.visible = true;
 
     const endpoint = plan.endpoint ?? plan.points?.[plan.points.length - 1] ?? { x: 0, y: 0 };
@@ -289,14 +311,17 @@ export class PreviewRenderer {
     this.label.position.set(x, y);
   }
 
-  /** @param {object} plan @param {object} context */
-  statusLabel(plan, context) {
-    if (plan.status === "impassable") return localize("KNKR_PATHING.Preview.Blocked", "Blocked");
-    if (plan.status === "contact") return localize("KNKR_PATHING.Preview.Contact", "Enemy contact");
-    if (plan.status === "budget") return localize("KNKR_PATHING.Preview.Budget", "Out of movement");
-    if (plan.routeMode === "squeeze" && !context.squeezeActive) {
-      return localize("KNKR_PATHING.Preview.Squeeze", "Squeeze");
+  /** @param {object} plan */
+  statusLabel(plan) {
+    if (plan.status === "impassable") {
+      const endpoint = plan.endpoint ?? plan.points?.[plan.points.length - 1];
+      if (endpoint && movedFromStart(plan, endpoint)) {
+        return localize("KNKR_PATHING.Preview.Potential", "Potential move");
+      }
+      return localize("KNKR_PATHING.Preview.Blocked", "Blocked");
     }
+    if (plan.status === "contact") return localize("KNKR_PATHING.Preview.Contact", "Enemy contact");
+    if (plan.status === "limited") return localize("KNKR_PATHING.Preview.Limited", "Movement limit");
     return "";
   }
 }

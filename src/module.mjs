@@ -16,11 +16,15 @@ import { checkCompatibility, isGridlessScene } from "./compat.mjs";
 import { planMovement } from "./core/planner.mjs";
 import { DragController } from "./foundry/drag-controller.mjs";
 import { PreviewRenderer } from "./foundry/preview.mjs";
-import { MovementLedger, WallCache } from "./foundry/adapters.mjs";
+import {
+  WallCache,
+  clearPassageException,
+  listPassageExceptions,
+  registerPassageException
+} from "./foundry/adapters.mjs";
 
 const preview = new PreviewRenderer();
 const wallCache = new WallCache();
-const ledger = new MovementLedger();
 
 let controller = null;
 let compatibility = null;
@@ -104,14 +108,6 @@ function wireLifecycleHooks() {
     session.forceReplan = true;
   });
 
-  Hooks.on("updateCombat", () => {
-    ledger.syncTurn();
-  });
-
-  Hooks.on("deleteCombat", () => {
-    ledger.clear();
-  });
-
   Hooks.on("knkrPathingSettingsChanged", () => {
     if (!getSetting(SETTING_KEYS.enabled)) controller?.endSession();
   });
@@ -125,10 +121,9 @@ function exposeApi() {
     version: module.version,
     compat: compatibility,
     plan: planMovement,
-    resetBudget: (token) => {
-      if (token) ledger.reset(token);
-      else ledger.clear();
-    },
+    registerPassageException,
+    clearPassageException,
+    listPassageExceptions,
     diagnostics: () => ({
       compat: compatibility,
       installed,
@@ -136,7 +131,14 @@ function exposeApi() {
       gridless: isGridlessScene(globalThis.canvas?.scene),
       walls: wallCache.get(globalThis.canvas?.scene).length,
       activeDrag: Boolean(controller?.session),
-      movement: controller?.session?.movement ?? null
+      movement: controller?.session?.action ?? null,
+      movementBudget: controller?.session?.movementLimit ?? null,
+      bodyRadius: controller?.session?.radius ?? null,
+      passageRadius: controller?.session?.passageRadius ?? null,
+      gapClearance: controller?.session?.passage?.gapRatio ?? null,
+      tokenSize: controller?.session?.passage?.sizeKey ?? null,
+      passageTags: controller?.session?.passage?.appliedTags ?? [],
+      passageExceptions: listPassageExceptions()
     })
   };
 }
@@ -171,7 +173,7 @@ Hooks.once("ready", () => {
     }
   }
 
-  controller = new DragController({ preview, wallCache, ledger });
+  controller = new DragController({ preview, wallCache });
   installed = controller.install();
   if (!installed) {
     notifyError(

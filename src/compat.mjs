@@ -40,12 +40,15 @@ export function getTokenClass() {
   return typeof globalThis.Token === "function" ? globalThis.Token : null;
 }
 
-/** Required token drag methods. Missing any of them disables the module. */
+/**
+ * Required token drag methods for the v13+ clone-based drag workflow. Missing
+ * any of them disables the module rather than half-installing it.
+ */
 export const REQUIRED_TOKEN_METHODS = Object.freeze([
-  "_onDragLeftStart",
-  "_onDragLeftMove",
-  "_onDragLeftDrop",
-  "_onDragLeftCancel"
+  "_initializeDragLeft",
+  "_updateDragDestination",
+  "_prepareDragLeftDropUpdates",
+  "_finalizeDragLeft"
 ]);
 
 /**
@@ -90,7 +93,7 @@ export function checkCompatibility() {
   }
 
   if (systemId() && systemId() !== "dnd5e") {
-    warnings.push(`The active system is "${systemId()}", not dnd5e. Wall and enemy collision still work, but D&D 5e movement budgets are unavailable.`);
+    warnings.push(`The active system is "${systemId()}", not dnd5e. Wall and enemy collision still work, but the manifest targets dnd5e.`);
   }
 
   if (!globalThis.PIXI?.Graphics) {

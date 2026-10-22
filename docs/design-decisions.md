@@ -2,49 +2,51 @@
 
 > **AI notice:** This file was created with AI assistance. See [NOTICE.md](../NOTICE.md).
 
-This document resolves §15 of the supplied design specification and records the deliberate limits of the 0.1.0 implementation. Each decision lists what is implemented, why, and what would be needed to change it.
+This document resolves §15 of the supplied design specification and records the deliberate limits of the 1.0.0 implementation. Each decision lists what is implemented, why, and what would be needed to change it.
 
-## 1. Squeezing geometry
+## 1. Passage clearance
 
-**Decision:** A creature's squeeze footprint is **one D&D 5e size category smaller**, modeled as a circle whose radius is `normalRadius × squeezeFactor`, with `squeezeFactor` defaulting to **0.5**.
+**Decision:** a token has two clearance values. Its **body radius** is half of its larger actual pixel dimension from `TokenDocument#getSize()`, and wall clearance everywhere outside an opening always uses that full radius. Its **gap width** is the token's actual width multiplied by an adjustable ratio, `0.75` by default. A 1×1 token on a 100 px / 5 ft grid therefore keeps 50 px wall clearance but may pass a 75 px (3.75 ft) opening.
 
-**Why:** 5e's Squeezing rule lets a creature move through a space wide enough for a creature one size smaller (a Medium creature uses a 2.5 ft space instead of 5 ft). In a gridless circular-footprint model, halving the diameter is the direct analogue. The footprint is not the token's rendered art; it is the displayed occupied space (document width/height × texture scale).
+The ratio can be changed for all sizes with **Default gap clearance**, and each D&D 5e size category (Tiny, Small, Medium, Large, Huge, Gargantuan) has an optional override. `0` means "use the default". Ratios are normalized to `(0, 1]` so a typo cannot widen a token past its body.
 
-**Configuration:** the factor is a world setting, so a DM can make squeezing stricter (for example `0.75`) or more permissive (`0.4`) without code changes. The squeeze radius is never larger than the normal radius. The multiplier is separately configurable.
+**Why:** the requested rule is that a passable gap is greater than token size × 0.75, with a global default and per-size exceptions. Reducing the wall radius globally would let a token clip every wall, so the reduced radius is confined to portal edges inside the measured opening. Ordinary approach and departure segments still use the body radius. The preview therefore stops at the opening when it is too narrow rather than hugging walls elsewhere.
 
-**Limit:** non-circular token footprints are approximated by a conservative circumscribed circle. Exact polygon/ellipse squeezing is out of scope for 0.1.0.
+**Gap measurement:** a wall opening is measured between its **actual wall points** — two wall endpoints, or an endpoint and the nearest point on an opposing wall face. The opening is compared directly with the token width × the resolved ratio, with only a `0.01` px floating-point tolerance. No waypoint offset or padding is subtracted from the opening. A portal has a midpoint and two lead points on each side of the opening along its normal; edges inside the portal ignore only its host walls and use the reduced passage radius. The extra lead points let a token finish leaving a short doorway whose jamb returns are deeper than one body radius. This lets the token cross and then leave toward a goal at any angle. A wall that merely touches an opening endpoint (a jamb meeting the wall) does not close it; only a wall crossing or ending inside the open span does. That keeps real doorways usable while still preventing a reduced-radius edge from tunnelling through a wall.
 
-## 2. Marker dimensions
+**Limit:** non-circular token footprints are approximated by a conservative circumscribed circle. Exact polygon/ellipse passage is out of scope.
 
-**Decision:** the squeeze marker is **1.5 scene feet in diameter** by default (≈30 px at the default 5 ft / 100 px scale), configurable in feet as `markerDiameterFeet`. The activation area is the marker circle plus a small padding (`markerActivationPaddingFeet`, default 0.25 ft).
+## 2. Tag exceptions
 
-**Why:** §15 of the design fixes 1.5 ft; the earlier §6.1 text mentions 5 ft, which is large enough to overlap tokens and walls. 1.5 ft is visible at normal zoom and clearly an interaction target, and the padding makes it forgiving to hit without requiring pixel precision. Marker size is stored in scene units and converted to pixels using scene scale, so it is consistent across scenes.
+**Decision:** passage exceptions are driven by **token tags**, but no exceptions ship by default. A tag rule is registered at runtime:
 
-## 3. Marker activation
+```js
+game.modules.get("knkr-pathing").api.registerPassageException("amorphous", 0.5);
+```
 
-**Decision:**
+The factor multiplies the token's body radius and therefore its default gap width as well (`0.5` halves both). Tags are read from `TokenDocument#tags` when Foundry provides it and from the module flag on the token or actor (`flags.knkr-pathing.tags`). The narrowest registered factor wins, and factors are clamped at `1` so a tag can never widen a token. `clearPassageException(tag)` and `listPassageExceptions()` are also exposed. The per-size gap ratio is applied after the tag factor.
 
-- Markers are produced only when the committed route to the cursor **requires squeezing** — that is, the normal-footprint route is impossible but the squeeze-footprint route exists. A normal route always wins, so markers never appear as shortcuts while ordinary movement is possible.
-- Dragging the token (its constrained center) into a marker's activation area commits to squeezing for that route.
-- Squeezing is cancelled automatically when a normal route to the current cursor becomes possible again (for example, the user backs out of the gap before entering it).
-- Once the token is inside a region that needs the smaller footprint, a normal route cannot exist from that position, so the state persists naturally. Adjacent squeeze passages keep the state active because the token never returns to normal clearance.
-- If the cursor leaves the marker before the token enters, the token remains on the last normally reachable point, so nothing illegal happens.
+**Why:** the user asked for the framework to be ready for future token tags without committing to specific traits now. Registration keeps the core testable and lets another module (or a macro) define the actual game rule later. Unknown tags do nothing.
 
-## 4. Movement accounting
+**Hook:** `Hooks.call("knkrPathingPassageProfile", token, profile)` runs after the profile is resolved, so another module can adjust `profile.radius` or `profile.passageRadius` for a rule this module does not know about.
 
-**Decision:** the module computes its **own per-segment cost** and clamps the preview/destination with it. It reads Foundry's native movement record for already-spent movement, but it does **not** rewrite Foundry's movement history or the core ruler.
+## 3. Movement accounting
 
-- Remaining budget = system speed for the active movement action − native spent movement − module-recorded extra squeeze cost.
-- Budget clamping is **combat-scoped**. Outside combat the preview still reports distance and cost, but the token is not clamped to a speed. This prevents exploration dragging from becoming stuck due to a turn resource that has no turn boundary outside combat.
-- Native spent movement comes from `TokenDocument#movementHistory` (v13+) when entries expose `cost` and `action`.
-- Extra squeeze cost (the difference between doubled and physical distance) is recorded by the module per token, per combat turn, and cleared when the turn changes, when combat ends, or when a drag starts with an empty native movement history.
-- If no usable speed/history data exists (non-dnd5e system, unlinked actor without movement data, or a version where the shapes differ), budget enforcement is skipped and the preview reports physical distance and computed cost only.
+**Decision:** the module **reports** route distance and, when [D&D 5e Movement Limiter & Undo](https://github.com/knkr03/dnd5e-movement-limiter) is active, also **consumes that module's remaining budget**. Movement Limiter remains the single owner of turn resources.
 
-**Why:** patching core movement history would risk corrupting the ruler and other modules. The design requires tracking physical length and movement cost separately; the module does that explicitly in its path segments and surfaces both.
+- The preview label shows the physical route distance in scene units.
+- The module does not read `TokenDocument#movementHistory` itself and does not maintain its own speed or spent-movement state.
+- When Movement Limiter's public `api.status(token)` reports a finite `remaining`, that value is used as the maximum route length from the drag origin. The route is truncated by actual scene distance, and the preview and committed waypoints both stop at the same point.
+- The truncation happens after pathfinding and after enemy contact clamping. If contact occurs before the budget, contact wins; if the budget ends first, the preview reports `limited` and the unseen contact is not reported.
+- Rotation routes are limited from the drag origin across their full committed route (approach plus arc), not just the current arc.
+- Without Movement Limiter, or when it reports `Infinity` (GM bypass, out-of-combat full allotment, teleport actions), the route is not clamped by this module.
+- The token's active movement action (`walk`, `fly`, …) is copied into committed waypoints so core records the movement under the right action.
 
-**Known limit:** the native ruler shows physical distance, while the module's label shows the adjusted cost. Integrating the multiplier into core's recorded movement needs a supported core API; until then this is a documented divergence. Budget clamping during enemy-perimeter rotation uses the current plan cost rather than accumulated orbital arc length, so it is approximate in that one interaction. Scene units are assumed to match the system's movement units (5 ft per grid unit by default); a scene measured in meters is not converted.
+**Why:** Movement Limiter exposes only a read-only `status()` API; it has no path-clamp hook. Applying its budget to the actual path is required because a path rerouted around a wall is longer than the straight line Movement Limiter clamps. Without this, replacing the waypoint list in `_prepareDragLeftDropUpdates` would let a token move farther than its remaining movement. Reading the budget instead of recomputing movement history keeps a single authority and avoids double-counting. The budget is snapshotted at drag start, matching the snapshot Movement Limiter takes for the same drag.
 
-## 5. Enemy classification
+**Known limit:** the module is gridless-only, while Movement Limiter can report budgets on any scene. Scene units are assumed to map to route length by `grid.distance / grid.size`, which is exact for gridless Euclidean movement. If another module changes Movement Limiter's budget mid-drag, the two snapshots can diverge; the module intentionally keeps the drag-start snapshot so it cannot move the goalposts during a drag.
+
+## 4. Enemy classification
 
 **Decision:** an enemy is selected by disposition, relative to the moving token's disposition, with a configurable policy:
 
@@ -58,13 +60,13 @@ Hidden tokens are excluded by default and can be included by setting. Defeated/i
 
 **Why:** conservative defaults avoid surprising friendly-fire collisions, and the policy setting resolves the neutral/unlinked case explicitly rather than guessing from actor types.
 
-## 6. Enemy contact geometry
+## 5. Enemy contact geometry
 
 **Decision:** enemy contact uses the **circular footprint approximation** (`sum of effective radii`), consistent with the moving token's footprint model. Contact is clamped at the first intersection along the route, with a small skin so touching is allowed but overlap is not.
 
 **Why:** exact token shapes (`token.shape`) can be polygons with holes; solving continuous first-contact against arbitrary polygons is disproportionate for a drag preview. The circular approximation is conservative for the usual square/circle 5e footprints and is what makes the cursor-relative perimeter rotation formula exact. It is documented as an approximation.
 
-## 7. Rotation versus ordinary movement
+## 6. Rotation versus ordinary movement
 
 **Decision:** confirmed. Rotation mode requires all of:
 
@@ -72,13 +74,16 @@ Hidden tokens are excluded by default and can be included by setting. Defeated/i
 2. the cursor is inside that enemy's footprint, and
 3. the interaction is part of the same drag.
 
-Every proposed perimeter position is validated against blocking walls, every other enemy, and the movement budget. If the direct angular step is blocked, the module walks the arc from the last valid angle toward the requested angle and clamps at the last legal point instead of jumping through an obstacle. When the cursor leaves the enemy's footprint, rotation ends at the preserved perimeter position and ordinary pathfinding resumes from there. If the cursor sits exactly on the enemy center, the last valid angle is kept.
+Every proposed perimeter position is validated against blocking walls and every other enemy. The live direction is the signed shorter angular delta from the current angle to the cursor. The committed route is a single arc from the angle at which rotation began to the current perimeter position, using the same shorter delta, so dragging the cursor across the enemy or back and forth cannot record the long way around. If the direct angular step is blocked, the module walks the arc in small steps and clamps at the last legal point instead of jumping through an obstacle. When the cursor leaves the enemy's footprint, rotation ends at the preserved perimeter position and ordinary pathfinding resumes from there. If the cursor sits exactly on the enemy center, the last valid angle is kept.
 
-## Additional limits in 0.1.0
+## Additional limits in 1.0.0
 
 - **Single-token dragging only.** Multi-token drags are skipped (no constraint applied) and logged in debug mode. The module does not silently half-apply to one of several selected tokens.
 - **Directional walls** (`dir`) are treated as fully blocking in both directions. One-way movement is not modeled.
 - **Terrain walls** and other movement-restriction levels are treated as blocking when `move` is not `None`; open doors are ignored, closed/locked doors block.
 - **Overhead tiles, regions, and elevations** are not considered; movement is 2D.
 - **Dynamic obstacles** besides tokens (for example vehicles or actively animated hazards) are not modeled.
-- **Foundry core pathfinding**: v13 introduced token movement constraints. The module applies its own constraint after the core drag handler; if a future core version changes the drag pipeline, the compatibility check disables the module with a notification rather than allowing illegal movement.
+- **Foundry core pathfinding**: v13 introduced token movement constraints and clone-based dragging. The module replaces the waypoint list in `_prepareDragLeftDropUpdates` rather than correcting the token after placement, so the committed movement is the previewed route. The commit also asks Foundry to skip its own wall pass (`constrainOptions.ignoreWalls`), because that pass uses the full token footprint and would trim a route at a squeeze opening the planner has already validated. Bounds, cost, and dnd5e token blocking still run. If a future core version changes these methods, the compatibility check disables the module with a notification rather than allowing illegal movement.
+- **Movement Limiter integration is read-only.** It depends on the module's public `status(token)` contract returning scene-unit `remaining`. If that API changes or is unavailable, Knkr Pathing leaves the route unclamped rather than reading private movement state.
+- **Core movement cost**: Foundry measures the committed route by distance. The module reports that distance and, when Movement Limiter is active, truncates the route before committing waypoints.
+- **Tag exceptions are runtime registrations.** They are not persisted in the world; a module or macro must register them on each load.

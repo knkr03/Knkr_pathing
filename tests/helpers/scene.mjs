@@ -3,8 +3,8 @@
 /** Scene scale used by all fixtures: 100 px per 5 ft. */
 export const UNITS_PER_PIXEL = 0.05;
 
-/** Medium token: 5 ft diameter, squeeze to 2.5 ft. */
-export const MEDIUM = { normalRadius: 50, squeezeRadius: 25 };
+/** Medium token: 5 ft across on the 100 px / 5 ft scale. */
+export const MEDIUM = { radius: 50 };
 
 /**
  * Build a Foundry-like wall document.
@@ -37,8 +37,8 @@ export function gapWalls(gap, options = {}) {
 
 /**
  * Closed room with a single central opening in its left wall. Unlike a finite
- * barrier, the only route inside is through the gap, which is what squeeze
- * classification must be tested against.
+ * barrier, the only route inside is through the gap, which is what a token's
+ * size limit must be tested against.
  * @param {number} gap Gap width in pixels.
  * @param {object} [options]
  */

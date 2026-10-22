@@ -7,8 +7,13 @@
 
 import { extractBlockingWalls } from "../core/walls.mjs";
 import { filterEnemies } from "../core/enemies.mjs";
-import { createFootprint } from "../core/footprint.mjs";
+import { resolvePassageProfile } from "../core/footprint.mjs";
+import { GAP_CLEARANCE, MODULE_ID } from "../constants.mjs";
 import { gridSize } from "../compat.mjs";
+import { readGapClearanceSettings } from "../settings.mjs";
+
+/** Module whose remaining-movement budget we consume when it is active. */
+export const MOVEMENT_LIMITER_MODULE_ID = "dnd5e-movement-limiter";
 
 /** @typedef {{x: number, y: number}} Point */
 
@@ -121,6 +126,45 @@ export function getDocumentCenter(token) {
 }
 
 /**
+ * The token's actual footprint in canvas pixels.
+ *
+ * TokenDocument#getSize() is the authoritative pixel size in Foundry v13+; it
+ * accounts for the scene's grid scaling and any special token shape. Fall back
+ * to the placeable's w/h and only then to document grid units. Texture scale
+ * is art scaling and is deliberately not part of the collision footprint.
+ *
+ * @param {object} token
+ * @param {object | null} [scene]
+ * @returns {{width: number, height: number}}
+ */
+export function getTokenSizePixels(token, scene = null) {
+  const document = token?.document;
+  try {
+    const size = document?.getSize?.();
+    const width = Number(size?.width);
+    const height = Number(size?.height);
+    if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+      return { width, height };
+    }
+  } catch {
+    // Fall through to the placeable dimensions.
+  }
+
+  const placeableWidth = Number(token?.w);
+  const placeableHeight = Number(token?.h);
+  if (Number.isFinite(placeableWidth) && placeableWidth > 0
+      && Number.isFinite(placeableHeight) && placeableHeight > 0) {
+    return { width: placeableWidth, height: placeableHeight };
+  }
+
+  const sizePx = gridSize(scene ?? globalThis.canvas?.scene);
+  return {
+    width: Math.max(0.1, Number(document?.width) || 1) * sizePx,
+    height: Math.max(0.1, Number(document?.height) || 1) * sizePx
+  };
+}
+
+/**
  * Move a token so its center lands on the given point. Foundry stores the
  * top-left position in pixels.
  * @param {object} token
@@ -128,8 +172,7 @@ export function getDocumentCenter(token) {
  */
 export function setTokenCenter(token, center) {
   if (!token || !center) return;
-  let width = Number(token.w);
-  let height = Number(token.h);
+  let { width, height } = getTokenSizePixels(token);
   if (!Number.isFinite(width) || !Number.isFinite(height)) {
     const sizePx = gridSize(globalThis.canvas?.scene);
     width = (Number(token.document?.width) || 1) * sizePx;
@@ -145,21 +188,194 @@ export function setTokenCenter(token, center) {
 }
 
 /**
- * Token footprint based on the document's occupied space and the scene scale.
+ * Tag-based clearance exceptions. Empty by default: ordinary tokens are
+ * limited strictly by their size. A future token tag (for example an
+ * "amorphous" or "incorporeal" trait) can be registered with a factor below 1
+ * to let that token use a narrower gap.
+ * @type {Map<string, {factor: number}>}
+ */
+const passageExceptions = new Map();
+
+/**
+ * Register a token-tag passage exception.
+ * @param {string} tag Tag name as it appears on the token or actor.
+ * @param {number} factor Clearance factor in (0, 1]. 0.5 lets the token use a gap half its size.
+ * @returns {boolean}
+ */
+export function registerPassageException(tag, factor) {
+  const name = String(tag ?? "").trim();
+  const value = Number(factor);
+  if (!name || !Number.isFinite(value) || value <= 0) return false;
+  passageExceptions.set(name, { factor: Math.min(1, value) });
+  return true;
+}
+
+/** @param {string} tag */
+export function clearPassageException(tag) {
+  return passageExceptions.delete(String(tag ?? "").trim());
+}
+
+/** @returns {Record<string, {factor: number}>} */
+export function listPassageExceptions() {
+  return Object.fromEntries(passageExceptions);
+}
+
+/**
+ * Collect token tags from the document and actor. Supports a future core
+ * `document.tags` collection as well as module flags on either document.
+ * @param {object} token
+ * @returns {string[]}
+ */
+export function getTokenTags(token) {
+  const tags = new Set();
+  const add = (value) => {
+    if (value == null) return;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed) tags.add(trimmed);
+      return;
+    }
+    if (typeof value[Symbol.iterator] === "function") {
+      for (const entry of value) add(entry);
+      return;
+    }
+    if (typeof value === "object") {
+      for (const entry of Object.keys(value)) add(entry);
+    }
+  };
+
+  const document = token?.document;
+  const actor = token?.actor;
+  add(document?.tags);
+  try {
+    add(document?.getFlag?.(MODULE_ID, "tags"));
+  } catch {
+    // Flags are optional.
+  }
+  add(document?.flags?.[MODULE_ID]?.tags);
+  try {
+    add(actor?.getFlag?.(MODULE_ID, "tags"));
+  } catch {
+    // Flags are optional.
+  }
+  add(actor?.flags?.[MODULE_ID]?.tags);
+  return [...tags];
+}
+
+/**
+ * Resolve the D&D 5e size category used for the per-size gap override.
+ * Foundry's token dimensions cannot distinguish Small from Medium (both are
+ * usually one square), so the actor's `system.traits.size` is authoritative.
+ * A footprint fallback keeps non-dnd5e tokens working.
+ *
+ * @param {object} token
+ * @param {object | null} [scene]
+ * @returns {string} One of GAP_CLEARANCE.buckets.
+ */
+export function getTokenSizeKey(token, scene = null) {
+  const actor = token?.actor ?? token?.document?.actor;
+  const rawSize = String(actor?.system?.traits?.size ?? "").toLowerCase().trim();
+  const mapped = GAP_CLEARANCE.actorSizes[rawSize];
+  if (mapped) return mapped;
+
+  const { width, height } = getTokenSizePixels(token, scene);
+  const sizePx = gridSize(scene ?? globalThis.canvas?.scene);
+  const squares = Math.max(width, height) / Math.max(1, sizePx);
+  if (squares <= 0.5) return "tiny";
+  if (squares >= 4) return "gargantuan";
+  if (squares >= 3) return "huge";
+  if (squares >= 2) return "large";
+  return "medium";
+}
+
+/**
+ * Passage profile for a token: physical body size, the gap clearance ratio
+ * (global default plus per-size override), and registered tag exceptions. A
+ * `knkrPathingPassageProfile` hook may adjust the profile for future tag rules
+ * implemented by other modules.
+ *
  * @param {object} token
  * @param {object | null} scene
- * @param {number} squeezeFactor
- * @returns {import("../core/footprint.mjs").Footprint}
+ * @param {object | null} [runtime] Settings snapshot from readRuntimeSettings().
+ * @returns {{
+ *   radius: number,
+ *   baseRadius: number,
+ *   diameter: number,
+ *   passageRadius: number,
+ *   passageDiameter: number,
+ *   factor: number,
+ *   gapRatio: number,
+ *   gapRatioSource: string,
+ *   sizeKey: string,
+ *   tags: string[],
+ *   appliedTags: string[]
+ * }}
  */
-export function getTokenFootprint(token, scene, squeezeFactor = 0.5) {
-  // TokenDocument width/height are in grid units by definition. Convert with
-  // the scene's pixel grid size. Do not use getSize() here: its units have
-  // differed across API generations, and a wrong assumption would silently
-  // shrink or grow the collision footprint by the grid scale.
-  const sizePx = gridSize(scene);
-  const widthPx = Math.max(0.1, Number(token?.document?.width) || 1) * sizePx;
-  const heightPx = Math.max(0.1, Number(token?.document?.height) || 1) * sizePx;
-  return createFootprint({ widthPx, heightPx, squeezeFactor });
+export function getPassageProfile(token, scene, runtime = null) {
+  // Use the token's actual pixel footprint, not a manually reconstructed
+  // width * grid constant. Foundry already owns the conversion and it stays
+  // correct for unusual grid sizes and token shapes.
+  const { width: widthPx, height: heightPx } = getTokenSizePixels(token, scene);
+  const gapSettings = runtime ?? readGapClearanceSettings();
+  const profile = resolvePassageProfile({
+    widthPx,
+    heightPx,
+    tags: getTokenTags(token),
+    exceptions: listPassageExceptions(),
+    gapRatio: gapSettings.gapClearance,
+    gapRatioOverrides: gapSettings.gapClearanceOverrides,
+    sizeKey: getTokenSizeKey(token, scene)
+  });
+
+  try {
+    globalThis.Hooks?.call?.("knkrPathingPassageProfile", token, profile);
+  } catch (error) {
+    console.warn("Knkr Pathing | a passage profile hook failed", error);
+  }
+
+  if (!Number.isFinite(profile.radius) || profile.radius <= 0) profile.radius = profile.baseRadius;
+  if (!Number.isFinite(profile.passageRadius) || profile.passageRadius <= 0) {
+    profile.passageRadius = profile.radius * (profile.gapRatio ?? GAP_CLEARANCE.defaultRatio);
+  }
+  profile.passageRadius = Math.min(profile.radius, profile.passageRadius);
+  profile.diameter = profile.radius * 2;
+  profile.passageDiameter = profile.passageRadius * 2;
+  return profile;
+}
+
+/**
+ * Remaining movement reported by dnd5e-movement-limiter, in scene units.
+ *
+ * That module exposes only a read-only `status(token)` API; it has no clamp or
+ * path hook. We therefore use its budget as a route length limit and commit a
+ * truncated route, which keeps its straight-line clamp from being bypassed
+ * when pathfinding reroutes around a wall. Absent, inactive, or unconstrained
+ * modules return null so this module keeps its standalone behavior.
+ *
+ * @param {object} token
+ * @returns {{remaining: number, speed: number | null, action: string | null, source: string} | null}
+ */
+export function getMovementLimit(token) {
+  try {
+    const module = globalThis.game?.modules?.get?.(MOVEMENT_LIMITER_MODULE_ID);
+    if (!module || module.active === false) return null;
+    const status = module.api?.status?.(token);
+    if (!status || typeof status !== "object" || status.remaining == null) return null;
+
+    const remaining = Number(status.remaining);
+    if (!Number.isFinite(remaining)) return null;
+
+    const speed = Number(status.speed);
+    return {
+      remaining: Math.max(0, remaining),
+      speed: Number.isFinite(speed) ? speed : null,
+      action: status.action == null ? null : String(status.action),
+      source: MOVEMENT_LIMITER_MODULE_ID
+    };
+  } catch (error) {
+    console.warn("Knkr Pathing | could not read the movement budget", error);
+    return null;
+  }
 }
 
 /** @param {object} token */
@@ -189,11 +405,11 @@ export function getEnemies(movingToken, scene, runtime) {
     if (token.id === movingToken?.id) continue;
     const center = getTokenCenter(token);
     if (!center) continue;
-    const footprint = getTokenFootprint(token, scene, runtime.squeezeFactor);
+    const profile = getPassageProfile(token, scene, runtime);
     candidates.push({
       id: String(token.id),
       center,
-      radius: footprint.normalRadius,
+      radius: profile.radius,
       disposition: getDisposition(token),
       hidden: isHiddenToken(token)
     });
@@ -217,151 +433,31 @@ export function getEnemies(movingToken, scene, runtime) {
  * @returns {Point}
  */
 export function getCursorPoint(event) {
-  const mouse = globalThis.canvas?.mousePosition;
-  if (mouse && Number.isFinite(mouse.x) && Number.isFinite(mouse.y)) {
-    return { x: mouse.x, y: mouse.y };
-  }
+  // The event's own pointer position is the least stale source. The canvas
+  // mousePosition global is updated on the same pointer event in Foundry, but
+  // another module may have moved or throttled the drag before us.
   const global = event?.global;
   if (global && Number.isFinite(global.x) && Number.isFinite(global.y)) {
     return { x: global.x, y: global.y };
+  }
+  const mouse = globalThis.canvas?.mousePosition;
+  if (mouse && Number.isFinite(mouse.x) && Number.isFinite(mouse.y)) {
+    return { x: mouse.x, y: mouse.y };
   }
   return { x: 0, y: 0 };
 }
 
 /**
- * Extract a numeric movement speed for an action from a dnd5e movement object.
- * Supports both legacy flat values and newer `speeds` objects.
- * @param {object} movement
- * @param {string} action
- * @returns {number | null}
- */
-function extractSpeed(movement, action) {
-  if (!movement) return null;
-  const candidates = [
-    movement[action],
-    movement.speeds?.[action],
-    action === "walk" ? movement.walk : null,
-    action === "walk" ? movement.speeds?.walk : null
-  ];
-
-  for (const candidate of candidates) {
-    if (candidate == null) continue;
-    if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
-    if (typeof candidate === "object") {
-      for (const key of ["value", "total", "max", "speed"]) {
-        const value = Number(candidate[key]);
-        if (Number.isFinite(value)) return value;
-      }
-    }
-    const numeric = Number(candidate);
-    if (Number.isFinite(numeric)) return numeric;
-  }
-  return null;
-}
-
-/**
- * Native movement record for a token.
+ * Movement action configured on the token, normalized to a string id.
+ * Foundry validates committed waypoint actions against
+ * CONFIG.Token.movement.actions.
  * @param {object} token
- * @returns {{
- *   available: boolean,
- *   action: string,
- *   speed: number | null,
- *   spent: number,
- *   units: string,
- *   historyEntries: number
- * }}
+ * @returns {string}
  */
-export function getNativeMovement(token) {
-  const document = token?.document;
-  const actor = token?.actor;
-  const movement = actor?.system?.attributes?.movement;
-  let rawAction = document?.movementAction ?? "walk";
-  if (rawAction && typeof rawAction === "object") {
-    rawAction = rawAction.id ?? rawAction.type ?? rawAction.key ?? "walk";
+export function getMovementAction(token) {
+  let action = token?.document?.movementAction ?? "walk";
+  if (action && typeof action === "object") {
+    action = action.id ?? action.type ?? action.key ?? "walk";
   }
-  const action = String(rawAction);
-  const speed = extractSpeed(movement, action);
-
-  let entries = [];
-  try {
-    const history = document?.movementHistory;
-    if (Array.isArray(history)) entries = history;
-    else if (history?.contents) entries = Array.from(history.contents);
-    else if (history && typeof history[Symbol.iterator] === "function") entries = Array.from(history);
-  } catch {
-    entries = [];
-  }
-
-  let spent = 0;
-  for (const entry of entries) {
-    if (!entry) continue;
-    if (entry.action && String(entry.action) !== action) continue;
-    const cost = Number(entry.cost ?? entry.distance ?? 0);
-    if (Number.isFinite(cost)) spent += cost;
-  }
-
-  return {
-    available: speed != null && Number.isFinite(speed),
-    action,
-    speed,
-    spent,
-    units: String(movement?.units ?? globalThis.canvas?.scene?.grid?.units ?? "ft"),
-    historyEntries: entries.length
-  };
-}
-
-/**
- * Module-side extra movement cost (the squeeze surcharge) that Foundry's own
- * movement record does not know about. Cleared on combat turn changes and by
- * the public API.
- */
-export class MovementLedger {
-  constructor() {
-    this.entries = new Map();
-    this.turnSignature = null;
-  }
-
-  /** @param {object} token @param {string} action */
-  key(token, action) {
-    return `${token?.id ?? "unknown"}|${action}`;
-  }
-
-  /** Clear all entries when the combat turn or round changes. */
-  syncTurn() {
-    const combat = globalThis.game?.combat;
-    const signature = combat ? `${combat.id}:${combat.round}:${combat.turn}` : "no-combat";
-    if (signature !== this.turnSignature) {
-      this.turnSignature = signature;
-      this.entries.clear();
-    }
-  }
-
-  /**
-   * @param {object} token
-   * @param {string} action
-   * @param {number} extra Scene units.
-   */
-  add(token, action, extra) {
-    const value = Number(extra);
-    if (!Number.isFinite(value) || value <= 0) return;
-    const key = this.key(token, action);
-    this.entries.set(key, (this.entries.get(key) ?? 0) + value);
-  }
-
-  /** @param {object} token @param {string} action */
-  getExtra(token, action) {
-    return this.entries.get(this.key(token, action)) ?? 0;
-  }
-
-  /** @param {object} token */
-  reset(token) {
-    const prefix = `${token?.id ?? "unknown"}|`;
-    for (const key of [...this.entries.keys()]) {
-      if (key.startsWith(prefix)) this.entries.delete(key);
-    }
-  }
-
-  clear() {
-    this.entries.clear();
-  }
+  return String(action);
 }

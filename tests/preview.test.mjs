@@ -89,29 +89,28 @@ function installPixiMock() {
 
 function plan(overrides = {}) {
   return {
-    status: "squeeze",
-    routeMode: "squeeze",
+    status: "normal",
+    routeMode: "normal",
+    start: { x: 0, y: 0 },
     points: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
     segments: [
       {
         a: { x: 0, y: 0 },
         b: { x: 100, y: 0 },
         distance: 5,
-        cost: 7,
-        mode: "squeeze"
+        cost: 5,
+        mode: "normal"
       }
     ],
-    markers: [{ x: 40, y: 0, radius: 15 }],
     endpoint: { x: 100, y: 0 },
     goal: { x: 200, y: 0 },
     totalDistance: 5,
-    totalCost: 7,
-    squeezeDistance: 2,
+    totalCost: 5,
     ...overrides
   };
 }
 
-test("preview attaches, draws paths/markers/labels, clears, and detaches", () => {
+test("preview attaches, draws the route and label, clears, and detaches", () => {
   const parent = installPixiMock();
   const renderer = new PreviewRenderer();
 
@@ -121,16 +120,13 @@ test("preview attaches, draws paths/markers/labels, clears, and detaches", () =>
 
   renderer.draw(plan(), {
     units: "ft",
-    showCostLabel: true,
-    squeezeMultiplier: 2,
-    squeezeActive: false,
+    showDistanceLabel: true,
     appliedCenter: { x: 90, y: 0 }
   });
 
   assert.ok(renderer.graphics.calls.length > 0);
-  assert.ok(renderer.markers.calls.length > 0);
   assert.equal(renderer.label.visible, true);
-  assert.match(renderer.label.text, /7 ft/);
+  assert.match(renderer.label.text, /5 ft/);
 
   renderer.clear();
   assert.equal(renderer.label.visible, false);
@@ -141,7 +137,66 @@ test("preview attaches, draws paths/markers/labels, clears, and detaches", () =>
   assert.equal(parent.children.length, 0);
 });
 
-test("blocked preview draws a terminal indicator and hides markers while squeezing", () => {
+test("a plan without costed segments still draws its polyline", () => {
+  const parent = installPixiMock();
+  const renderer = new PreviewRenderer();
+  renderer.attach();
+
+  renderer.draw(
+    plan({
+      routeMode: "rotation",
+      segments: null,
+      points: [{ x: 0, y: 0 }, { x: 50, y: 40 }, { x: 100, y: 90 }],
+      endpoint: { x: 100, y: 90 }
+    }),
+    { units: "ft", showDistanceLabel: false }
+  );
+
+  const lineCalls = renderer.graphics.calls.filter(([name]) => name === "lineTo");
+  assert.ok(lineCalls.length >= 4, `expected outline and route strokes, got ${lineCalls.length}`);
+
+  // A malformed segment list must not suppress the polyline fallback.
+  renderer.draw(
+    plan({
+      segments: [{ mode: "blocked" }],
+      points: [{ x: 0, y: 0 }, { x: 20, y: 20 }]
+    }),
+    { units: "ft", showDistanceLabel: false }
+  );
+  assert.ok(renderer.graphics.calls.some(([name]) => name === "lineTo"));
+
+  renderer.detach();
+  assert.equal(parent.children.length, 0);
+});
+
+test("a limited plan uses the amber route and movement-limit label", () => {
+  const parent = installPixiMock();
+  const renderer = new PreviewRenderer();
+  renderer.attach();
+
+  renderer.draw(
+    plan({
+      status: "limited",
+      routeMode: "limited",
+      endpoint: { x: 100, y: 0 },
+      movementLimit: { remaining: 5, distance: 5, remainingAfter: 0, exhausted: true }
+    }),
+    { units: "ft", showDistanceLabel: true }
+  );
+
+  assert.equal(renderer.label.visible, true);
+  assert.match(renderer.label.text, /Movement limit/);
+  assert.match(renderer.label.text, /5 ft/);
+  assert.ok(
+    renderer.graphics.calls.some(([name, , color]) => name === "lineStyle" && color === 0xffc857),
+    "limited routes should use the amber route color"
+  );
+
+  renderer.detach();
+  assert.equal(parent.children.length, 0);
+});
+
+test("a blocked preview marks its potential stopping point", () => {
   const parent = installPixiMock();
   const renderer = new PreviewRenderer();
   renderer.attach();
@@ -150,30 +205,49 @@ test("blocked preview draws a terminal indicator and hides markers while squeezi
     plan({
       status: "impassable",
       routeMode: "impassable",
-      markers: [],
-      endpoint: { x: 0, y: 0 },
-      totalCost: 5
+      start: { x: -400, y: 0 },
+      points: [{ x: -400, y: 0 }, { x: -250, y: 0 }],
+      segments: [
+        { a: { x: -400, y: 0 }, b: { x: -250, y: 0 }, distance: 7.5, cost: 7.5, mode: "normal" }
+      ],
+      endpoint: { x: -250, y: 0 },
+      goal: { x: 0, y: 0 },
+      totalDistance: 7.5
     }),
-    { units: "ft", showCostLabel: true, squeezeActive: false }
+    { units: "ft", showDistanceLabel: true }
   );
 
+  assert.ok(
+    renderer.graphics.calls.some(([name, x, y]) => name === "drawCircle" && x === -250 && y === 0),
+    "the reachable endpoint must use the same marker as a normal route"
+  );
+  assert.match(renderer.label.text, /Potential move/);
+
+  renderer.detach();
+  assert.equal(parent.children.length, 0);
+});
+
+test("blocked preview draws a terminal indicator and hides its label when asked", () => {
+  const parent = installPixiMock();
+  const renderer = new PreviewRenderer();
+  renderer.attach();
+
+  renderer.draw(
+    plan({
+      status: "impassable",
+      routeMode: "impassable",
+      segments: [],
+      endpoint: { x: 0, y: 0 }
+    }),
+    { units: "ft", showDistanceLabel: true }
+  );
+
+  assert.equal(renderer.label.visible, true);
+  assert.match(renderer.label.text, /Blocked/);
   assert.ok(renderer.graphics.calls.some(([name]) => name === "lineTo"));
-  assert.equal(
-    renderer.markers.calls.filter(([name]) => name !== "clear").length,
-    0
-  );
 
-  renderer.draw(plan(), {
-    units: "ft",
-    showCostLabel: false,
-    squeezeActive: true
-  });
+  renderer.draw(plan(), { units: "ft", showDistanceLabel: false });
   assert.equal(renderer.label.visible, false);
-  assert.equal(
-    renderer.markers.calls.filter(([name]) => name !== "clear").length,
-    0,
-    "markers hidden after committing"
-  );
 
   renderer.detach();
   assert.equal(parent.children.length, 0);

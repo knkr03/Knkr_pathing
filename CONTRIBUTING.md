@@ -6,7 +6,7 @@
 
 - Keep the AI attribution notice in every file and in `NOTICE.md`.
 - The `src/core/` directory must stay free of Foundry globals so it remains unit-testable under plain Node.
-- Add or update tests for any behavior change in the geometry, pathfinding, squeeze, cost, or enemy code.
+- Add or update tests for any behavior change in the geometry, pathfinding, gap clearance, cost, or enemy code.
 - Do not weaken assertions or add ignore directives to make a check pass; fix the behavior.
 
 ## Local workflow

@@ -2,25 +2,25 @@
 
 > **AI notice:** This repository and every file in it were created with AI assistance (Freebuff / Codebuff). See [NOTICE.md](NOTICE.md).
 
-A Foundry VTT module for **D&D 5e gridless scenes** that turns token dragging into constrained movement: wall-aware pathfinding, squeeze-only gap detection with an interaction marker, doubled movement cost while squeezing, and hostile-token collision with cursor-relative rotation around an enemy.
+A Foundry VTT module for **D&D 5e gridless scenes** that turns token dragging into constrained movement: wall-aware pathfinding, token-size passage limits, and hostile-token collision with cursor-relative rotation around an enemy.
 
 Design specification: [docs/design-decisions.md](docs/design-decisions.md) records how the open questions in the supplied spec were resolved. Architecture: [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
-`0.1.0` is the initial implementation of the design's Stages 1–6. The geometry, pathfinding, gap classification, cost, and enemy-rotation engines are covered by automated unit tests (`npm test`). The Foundry integration layer targets Foundry **v13** and **v14** and is written defensively, but it has **not yet been exercised inside a live Foundry instance** in this development environment. Treat it as a test candidate, not a verified release: run the matrix in [docs/testing.md](docs/testing.md) before using it in a game.
+`1.0.0` is the first stable release. The geometry, pathfinding, size classification, and enemy-rotation engines are covered by automated unit tests (`npm test`). The module has been loaded and smoke-tested live on Foundry **13.351** with dnd5e **5.3.3**, including live wall geometry, gap clearance, and partial moves. The remaining manual matrix in [docs/testing.md](docs/testing.md), especially Foundry **v14** and the full drag/drop workflow, should still be run before relying on it in a long-running game.
 
 ## Features
 
 - **Gridless-only** operation, with automatic disable when the active scene uses a grid.
 - **Wall-aware pathfinding** using an expanded-obstacle visibility graph and A*, with direct-path fast path, waypoint pruning, and path smoothing.
-- **Gap classification**: normal passage, squeeze-only passage, impassable passage. Token footprint (size and texture scale) is used, never just the token center.
-- **Squeeze markers**: a small circle at the entrance to each squeeze-only passage in the current route. Drag the token onto the marker to commit to squeezing.
-- **Two footprint profiles**: normal radius and D&D 5e one-size-smaller squeeze radius (50% by default; configurable).
-- **Per-segment movement cost**: `normal distance + squeeze distance × 2`, applied only to the narrow section, with a configurable multiplier and optional movement-budget clamp.
+- **Configurable gap clearance**: a gap is measured between the actual wall points and compared with the token's actual pixel footprint. By default a gap is passable at 75% of the token's width, from any approach angle. The default ratio is adjustable, and each D&D 5e size category can override it. Doorways with jamb returns work, and the committed movement trusts the planned route instead of letting Foundry re-check it with the full token footprint. Full wall clearance is still enforced outside the opening, so this is not a general wall-hugging squeeze.
+- **Tag exceptions**: `game.modules.get('knkr-pathing').api.registerPassageException(tag, factor)` lets a future token tag (for example an amorphous or incorporeal trait) use a narrower gap. No tags are registered by default.
+- **Movement-limiter compatibility**: when [D&D 5e Movement Limiter & Undo](https://github.com/knkr03/dnd5e-movement-limiter) is active, its remaining movement budget also truncates the pathfound route, including routes rerouted around walls. The preview turns amber and stops at the budget instead of bypassing that module's clamp.
+- **Partial moves**: when the destination is unreachable, the token still advances as far as its full body clearance allows, and the preview marks the reachable stopping point just like a normal route endpoint. Sealed rooms and too-narrow openings no longer leave the token at the drag origin.
 - **Hostile-token collision**: the preview and the token stop at the first contact point along the path.
-- **Rotate around an enemy**: while touching an enemy, drag the cursor over that enemy to orbit it; wall and other-enemy collisions are still enforced.
-- **Live preview** drawn on the canvas: normal, squeezing, blocked, contact, and budget-exhausted states, with an optional cost label.
+- **Rotate around an enemy**: while touching an enemy, drag the cursor over that enemy to orbit it along the shorter arc; wall and other-enemy collisions are still enforced.
+- **Live preview** drawn on the canvas: normal, movement-limited (amber), blocked, rotation, and contact states, with an optional distance label.
 
 ## Installation
 
@@ -51,32 +51,41 @@ Then launch Foundry with the module enabled in a **gridless** D&D 5e scene.
 
 1. Open a gridless scene whose walls have the **Normal** movement restriction (doors work: open doors are ignored, closed and locked doors block).
 2. Drag a single token. A path preview appears.
-3. If the destination is only reachable through a narrow gap, the token stops before the gap and an orange squeeze marker appears. Drag the token onto the marker to commit; the path and cost update to the squeeze route.
-4. Dragging over a hostile token while touching it orbits that token instead of crossing it.
+3. If the destination requires passing through a gap narrower than 75% of the token's width (or the configured value), the route stops at the last legal point before the gap and the destination is marked blocked. Use a smaller token, a wider gap, adjust the setting, or register a tag exception for that token.
+4. If D&D 5e Movement Limiter is active and the route costs more than the actor's remaining movement, the route stops at the budget and the preview label shows **Movement limit**. The committed waypoints stop at the same point.
+5. Dragging over a hostile token while touching it orbits that token instead of crossing it.
 
 Settings are under **Configure Settings → Module Settings → Knkr Pathing**:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | Enable pathfinding | on | Master client-side toggle. |
-| Squeeze footprint factor | 0.5 | Squeeze radius = normal radius × this value. 0.5 matches 5e "one size smaller". |
-| Squeeze cost multiplier | 2 | Cost multiplier applied to squeeze segments. |
-| Squeeze marker diameter | 1.5 ft | Display and activation size of the marker. |
+| Default gap clearance | 0.75 | A gap is passable at this fraction of the token's width. Applies to every size. |
+| Tiny/Small/Medium/Large/Huge/Gargantuan gap clearance | 0 | Optional per-size override. `0` uses the default. |
 | Enemy collision | Hostile only | Which dispositions block movement (hostile, hostile + neutral, all non-friendly). |
 | Include hidden enemies | off | Whether hidden hostile tokens block movement. |
-| Enforce movement budget | on | During combat, clamp the path to remaining movement when the system exposes a usable budget. Outside combat, costs are shown but movement is not clamped. |
-| Show cost label | on | Draw distance/cost text beside the preview. |
+| Show distance label | on | Draw the route distance beside the preview. |
 | Debug logging | off | Verbose console diagnostics. |
 
 A keybinding (**Knkr Pathing: Toggle pathfinding**) is registered and unbound by default.
 
 ## How it works (short version)
 
-- Blocking wall segments are treated as capsules expanded by the moving token's normal or squeeze radius. Clearance between a path and a wall is the minimum segment-to-segment distance.
+- Blocking wall segments are treated as capsules expanded by the moving token's radius. Clearance between a path and a wall is the minimum segment-to-segment distance.
+- The body radius is half of the token's larger **actual** pixel dimension from `TokenDocument#getSize()`. A 1×1 token on a 100 px grid has a 50 px radius; a 2×2 token has 100 px. Art texture scale does not change the collision footprint.
 - A direct start→goal segment is used when clear. Otherwise candidate waypoints are generated around expanded wall endpoints and connected by visibility, then A* finds the shortest valid route.
-- Squeezing is detected by planning the same route with the smaller radius: if the normal route fails and the squeeze route succeeds, the narrow clearance runs along the squeeze route become squeeze-only passages.
-- Costs are computed per segment from sampled clearance, so the multiplier applies only while the token's footprint actually needs the reduced profile.
+- Each wall opening is also measured directly between its actual endpoints (or an endpoint and an opposing wall face). If the opening reaches the configured threshold (75% of the token's width by default), its midpoint and two perpendicular lead-in points on either side become a portal. The extra lead points let the token finish leaving a doorway with short jamb returns. Only the portal's own crossing edges use the reduced gap radius and ignore the walls that form the opening; every other edge keeps full body clearance. A perpendicular wall touching the opening at a corner does not close it. The token can cross and then leave toward any angle instead of only perpendicular to the gap.
+- The planned route is committed with Foundry's native wall pass disabled, because that pass only knows the token's full footprint and would trim the route at a squeeze opening. Bounds, movement cost, and dnd5e token blocking remain in effect.
 - Enemy tokens are not pathfinding obstacles; they are clamp obstacles. The route stops at first contact, which keeps behavior predictable and enables perimeter rotation.
+- Remaining movement is read from D&D 5e Movement Limiter's public `status(token)` API when that module is active. The route is then truncated by actual scene distance before the preview and waypoints are committed. The planned goal comes from the raw cursor, not Movement Limiter's clamped drag destination, so a wall detour is still found instead of stalling at the clamped cursor point.
+
+## Compatibility
+
+### D&D 5e Movement Limiter & Undo
+
+Knkr Pathing reads `game.modules.get("dnd5e-movement-limiter").api.status(token)` when that module is active. Its `remaining` value is in scene units and is treated as a maximum route length from the drag origin. This is deliberately a read-only integration: Movement Limiter remains the single owner of turn resources and movement history. When it is absent, inactive, bypassing the limit, or reporting `Infinity`, Knkr Pathing leaves the route unclamped.
+
+Because the limit is applied to the pathfound route rather than only to the cursor's straight line, rerouting around a wall cannot exceed the remaining distance. The committed waypoints are truncated at the same point the preview shows. The module plans toward the raw cursor and applies the budget itself; Movement Limiter's clamped destination is not used as the path goal.
 
 ## Development
 
@@ -86,6 +95,7 @@ Requires Node.js 20+.
 npm test          # unit tests (node:test, no dependencies)
 npm run validate  # manifest/package consistency and AI notice coverage
 npm run build     # builds dist/knkr-pathing/ and the release zip
+npm run install:local -- "<Foundry Data>/modules"  # copies the build into a live test world
 ```
 
 No bundler is used. The module is plain ES modules so it can be loaded directly by Foundry and imported by Node tests. See [CONTRIBUTING.md](CONTRIBUTING.md) for the release process.
